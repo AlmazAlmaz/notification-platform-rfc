@@ -1,0 +1,38 @@
+@startuml
+title Option A — normal critical delivery via push
+hide footbox
+autonumber
+skinparam sequenceMessageAlign center
+actor "Bank service\nproducer outbox" as Producer
+participant "Notification API" as API
+database "PostgreSQL\nledger + outbox" as DB
+participant "Outbox relay" as Relay
+queue "Kafka\ncritical topics" as Kafka
+participant "Orchestrator" as FSM
+participant "Push worker" as Worker
+participant "FCM / APNs" as Push
+actor "Bank app" as App
+participant "Receipt Gateway" as Receipt
+
+Producer -> API: Submit(logical_key, event, user)
+API -> DB: BEGIN; unique inbox; notification; outbox; COMMIT
+DB --> API: Synchronous durable commit
+API --> Producer: 202 Accepted(notification_id)
+note over API, DB: 202 means durable acceptance, not device delivery.
+Relay -> DB: Claim unpublished outbox
+Relay -> Kafka: Publish notification_id
+Kafka -> FSM: Deliver event (duplicates possible)
+FSM -> DB: Dedup inbox + select eligible route\ncreate PUSH attempt + deadline t0+8s + command outbox
+Relay -> Kafka: Publish attempt command
+Kafka -> Worker: attempt_id
+Worker -> DB: Claim attempt; verify current state / preference version
+Worker -> Push: Send(notification_id, attempt_id, TTL=8s)
+Push --> Worker: Provider accepted + message_id
+Worker -> DB: Record accepted; wait for receipt
+Push -> App: Push message
+App -> App: Persistent dedup by notification_id
+App -> Receipt: Authenticated received ACK(notification_id)
+Receipt -> DB: Receipt inbox + CAS DELIVERED\ncancel unsent future attempts; outbox; COMMIT
+note over DB, Receipt: App receipt is delivery evidence; opening / reading is separate.
+note over Producer, Kafka: Crash after COMMIT or duplicate publication is recovered by outbox + inbox.
+@enduml

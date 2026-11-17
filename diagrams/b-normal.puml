@@ -1,0 +1,42 @@
+@startuml
+title Option B — normal critical delivery with a durable workflow
+hide footbox
+autonumber
+skinparam sequenceMessageAlign center
+actor "Bank service" as Producer
+participant "Notification API" as API
+database "Admission PostgreSQL\n+ start/receipt outbox" as Index
+participant "Relay + Kafka\nWorkflow starter" as Starter
+participant "Temporal Service\n+ durable history DB" as Temporal
+participant "Go Workflow /\nActivity workers" as Worker
+participant "FCM / APNs" as Push
+actor "Bank app" as App
+participant "Receipt Gateway" as Receipt
+
+Producer -> API: Submit(logical_key)
+API -> Index: Atomic unique inbox + notification + start_outbox
+Index --> API: Synchronous durable commit
+API --> Producer: 202 Accepted (durable admission)
+Starter -> Index: Read committed start_outbox
+Starter -> Temporal: StartWorkflow(ID=logical_key, RejectDuplicate)
+Temporal -> Temporal: Persist WorkflowExecutionStarted
+Temporal --> Starter: Started / AlreadyStarted
+note over Starter, Temporal: Retrying start after a crash cannot create a second logical workflow.\nAdmission unique-key retention also covers completed histories.
+Temporal -> Worker: Workflow task
+Worker -> Temporal: Schedule push activity + durable 8s timer
+Temporal -> Worker: Activity task(attempt_id)
+Worker -> Push: Send(notification_id, stable attempt_id, TTL=8s)
+Push --> Worker: Provider accepted
+Worker -> Temporal: Activity result (acceptance only)
+Push -> App: Push
+App -> App: Persistent dedup(notification_id)
+App -> Receipt: Authenticated received ACK
+Receipt -> Index: Atomic receipt inbox + receipt_outbox; COMMIT
+Starter -> Temporal: Signal(receipt_id, notification_id, delivered evidence)
+Temporal -> Temporal: Persist signal in workflow history
+Temporal -> Worker: Workflow task with receipt
+Worker -> Worker: Workflow dedup by receipt_id
+Worker -> Temporal: DELIVERED; cancel future timers / activities
+Starter -> Index: Project delivered business status asynchronously
+note over Index, Temporal: History is the delivery-state authority.\nThe business index is a rebuildable read projection.
+@enduml

@@ -1,0 +1,50 @@
+@startuml
+title Option B — durable timer failover, worker crash and late signal
+hide footbox
+autonumber
+skinparam sequenceMessageAlign center
+participant "Temporal Service\n+ durable history DB" as Temporal
+participant "Workflow worker" as WF
+participant "Activity worker" as Activity
+participant "SMS-A / SMS-B" as SMS
+participant "Email" as Email
+participant "Receipt Gateway\n+ durable receipt_outbox" as Receipt
+
+note over Temporal, WF: Push accepted, no authenticated app receipt by t0+8s.
+Temporal -> WF: TimerFired + current history
+WF -> Temporal: Schedule SMS-A activity(attempt_id)
+Temporal -> Activity: SMS-A activity task
+Activity -> SMS: Send(stable attempt_id idempotency key)
+alt Activity worker crashes after provider accepted
+  Temporal -> WF: Activity timeout (submit MaximumAttempts=1)
+  WF -> Temporal: Schedule separate reconcile Activity(same attempt_id)
+  Temporal -> Activity: Safe reconcile Activity task
+  Activity -> SMS: Query status by stable attempt_id
+  note over Activity, SMS: Unsafe submit is not retried automatically.\nSubmit retry only with contractual idempotency and same key.\nStatus-query retries are safe; workflow replay is not exactly-once I/O.
+else Definitive provider rejection
+  SMS --> Activity: Not accepted
+  Activity -> Temporal: Definitive failure result
+  Temporal -> WF: Workflow task
+  WF -> Temporal: Schedule SMS-B activity (new attempt_id)
+  Temporal -> Activity: SMS-B activity task
+  Activity -> SMS: Send through independent SMS-B
+else Network result unknown
+  Activity -> Temporal: UNKNOWN result
+  WF -> Temporal: Durable status-query timer until t0+30s
+  Temporal -> Activity: Query same attempt
+  Activity -> SMS: Query attempt_id
+  alt Still unknown at t0+30s
+    Temporal -> WF: Reconciliation timer fired
+    WF -> Temporal: Schedule eligible email; record duplicate risk
+    Temporal -> Activity: Email activity
+    Activity -> Email: Send(notification_id)
+  end
+end
+SMS -> Receipt: Signed delivered receipt
+Receipt -> Receipt: Persist receipt + outbox before HTTP ACK
+Receipt -> Temporal: Retried Signal(receipt_id, delivered evidence)
+Temporal -> WF: Workflow task; ordered history / receipt_id dedup
+WF -> Temporal: Mark DELIVERED; cancel not-yet-dispatched work
+note over Temporal, Activity: Replay recovers workflow state after restart.\nLate signals stop future work; already-sent SMS cannot be recalled.
+Temporal -> WF: At60s unresolved: SLO breach; continue recovery\nAt24h unresolved: escalate, do not report delivery
+@enduml

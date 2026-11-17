@@ -1,0 +1,49 @@
+@startuml
+!pragma layout smetana
+!define RELATIVE_INCLUDE .
+!include lib/C4_Container.puml
+LAYOUT_TOP_DOWN()
+title Option A — Notification Platform / C4 Container
+
+System_Ext(producer, "Bank product services", "Committed business event + producer outbox")
+System_Ext(profile, "Customer profile", "Verified contacts, preferences and consent version")
+System_Ext(provider, "Delivery providers", "FCM / APNs, independent SMS-A / SMS-B, email")
+Person(customer, "Customer", "Bank application / phone / mailbox")
+
+System_Boundary(platform, "Notification Platform — 3 availability zones") {
+  Container(api, "Critical Notification API", "Go, HTTPS; reserved pool", "Authentication, validation, logical-key deduplication")
+  ContainerDb(ledger, "Critical Delivery Ledger", "PostgreSQL 18; 8 shard groups; 3-AZ sync HA", "Authoritative notification FSM, attempts, timers, receipts and outbox; 256 logical buckets")
+  Container(relay, "Outbox Relay", "Go", "Publish committed outbox; duplicate publication is safe")
+  ContainerQueue(kafka, "Critical event streams", "Dedicated Apache Kafka 4.1 cluster", "Critical events and attempt commands; RF=3 across AZ, min ISR=2; at-least-once")
+  Container(fsm, "Delivery Orchestrator", "Go", "CAS transitions, durable deadlines, retry and channel failover")
+  Container(adapter, "Channel Workers", "Go", "Independent push / SMS / email pools, provider quotas and circuit breakers")
+  Container(receipts, "Receipt Gateway", "Go, HTTPS", "Authenticated app ACK / provider callback; durable receipt deduplication")
+  Container(obs, "Observability", "OpenTelemetry, Prometheus, Grafana, Tempo", "Latency, backlog, delivery evidence and paging; durable audit remains in ledger")
+  Container(bulk, "Bulk Delivery Service", "Go; independent resource pool", "Service and marketing admission / delivery; simplified optional path")
+  ContainerQueue(bulkkafka, "Bulk event streams", "Independent Apache Kafka 4.1 cluster", "Service / marketing topics, quotas and backpressure")
+  ContainerDb(bulkdb, "Bulk Delivery Storage", "Independent PostgreSQL 18 HA cluster", "Optional notification state; separate I/O budget from critical ledger")
+}
+
+Rel(producer, api, "Submit event; repeat same logical key", "HTTPS")
+Rel(producer, bulk, "Submit optional notifications", "HTTPS")
+Rel(bulk, bulkkafka, "Publish / consume optional work", "Kafka")
+Rel(bulk, bulkdb, "Persist optional delivery state", "SQL")
+Rel(api, ledger, "Atomic inbox + notification + outbox", "SQL")
+Rel(ledger, relay, "Committed outbox records", "SQL poll")
+Rel(relay, kafka, "Publish notification / attempt events", "Kafka")
+Rel(kafka, fsm, "Consume by priority", "Kafka")
+Rel(fsm, ledger, "CAS state, attempt + command outbox", "SQL")
+Rel(fsm, profile, "Read eligible channels + preference version", "HTTPS")
+Rel(kafka, adapter, "Consume durable attempt commands", "Kafka")
+Rel(adapter, ledger, "Claim attempt, store provider result", "SQL")
+Rel(adapter, provider, "Send / query same attempt idempotency key", "HTTPS")
+Rel(provider, customer, "Deliver at least one eligible channel")
+Rel(provider, receipts, "Signed delivery receipt", "HTTPS")
+Rel(customer, receipts, "Authenticated push receipt", "HTTPS")
+Rel(receipts, ledger, "Receipt inbox + CAS + outbox", "SQL")
+Rel(fsm, obs, "Metrics / traces / audit")
+Rel(adapter, obs, "Provider latency / failures / costs")
+Rel(receipts, obs, "Delivery evidence / late duplicates")
+
+SHOW_LEGEND()
+@enduml

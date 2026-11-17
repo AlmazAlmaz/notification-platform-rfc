@@ -1,0 +1,49 @@
+@startuml
+!pragma layout smetana
+!define RELATIVE_INCLUDE .
+!include lib/C4_Container.puml
+LAYOUT_LEFT_RIGHT()
+title Option B — durable workflows / C4 Container
+
+System_Ext(producer, "Bank product services", "Business transaction + producer outbox")
+System_Ext(profile, "Customer profile", "Verified contacts, preferences and consent version")
+System_Ext(provider, "Delivery providers", "FCM / APNs, independent SMS-A / SMS-B, email")
+Person(customer, "Customer", "Bank app / phone / mailbox")
+
+System_Boundary(platform, "Notification Platform — 3 availability zones") {
+  Container(api, "Critical Notification API", "Go, HTTPS; reserved pool", "Validate and deduplicate logical key")
+  ContainerDb(indexdb, "Critical admission and business index", "PostgreSQL 18; 3-AZ sync HA", "Unique inbox, start_outbox, receipt_outbox; status projection, not workflow authority")
+  Container(starter, "Relay / Workflow Starter", "Go", "Retry idempotent StartWorkflow; deliver durable receipt signals")
+  ContainerQueue(kafka, "Critical admission streams", "Dedicated Apache Kafka 4.1 cluster", "Replay-safe starts / receipts; RF=3 across AZ, min ISR=2; isolated from bulk")
+  Container(temporal, "Temporal Service", "Temporal Server", "Authoritative workflow history, durable timers and signals")
+  ContainerDb(history, "Temporal persistence", "Separate PostgreSQL 18; 3-AZ sync HA", "Authoritative workflow history and tasks; isolated from business index and bulk")
+  Container(workers, "Workflow and Activity Workers", "Go SDK", "One workflow / logical notification; channel adapters, quotas, circuit breakers")
+  Container(receipts, "Receipt Gateway", "Go, HTTPS", "Validate callback / app receipt; persist before acknowledging")
+  Container(obs, "Observability", "OpenTelemetry, Prometheus, Grafana, Tempo", "Workflow latency, task queue backlog, cost, audit and paging")
+  Container(bulk, "Bulk Delivery Service", "Go; independent resource pool", "Service / marketing delivery; separate optional task queues")
+  ContainerQueue(bulkkafka, "Bulk event streams", "Independent Apache Kafka 4.1 cluster", "Optional work with independent quotas and backpressure")
+  ContainerDb(bulkdb, "Bulk Delivery Storage", "Independent PostgreSQL 18 HA cluster", "Separate optional state and I/O budget")
+}
+
+Rel(producer, api, "Submit same logical key on retry", "HTTPS")
+Rel(producer, bulk, "Submit optional notifications", "HTTPS")
+Rel(bulk, bulkkafka, "Publish / consume optional work", "Kafka")
+Rel(bulk, bulkdb, "Persist optional state", "SQL")
+Rel(api, indexdb, "Atomic inbox + notification + start_outbox", "SQL")
+Rel(starter, indexdb, "Read start / receipt outbox; update projection", "SQL")
+Rel(starter, kafka, "Publish committed starts", "Kafka")
+Rel(kafka, starter, "Consume starts by priority", "Kafka")
+Rel(starter, temporal, "StartWorkflow(ID=logical_key, RejectDuplicate); receipt Signals", "gRPC")
+Rel(temporal, history, "Persist history / tasks", "SQL")
+Rel(workers, temporal, "Poll tasks; record commands / activity results", "gRPC")
+Rel(workers, profile, "Read current eligible route", "HTTPS activity")
+Rel(workers, provider, "Send / query stable attempt idempotency key", "HTTPS activity")
+Rel(provider, customer, "Deliver eligible channel")
+Rel(provider, receipts, "Signed delivery receipt", "HTTPS")
+Rel(customer, receipts, "Authenticated app received ACK", "HTTPS")
+Rel(receipts, indexdb, "Atomic receipt inbox + receipt_outbox", "SQL")
+Rel(workers, obs, "Metrics / traces / audit")
+Rel(temporal, obs, "History / task queue health")
+
+SHOW_LEGEND()
+@enduml

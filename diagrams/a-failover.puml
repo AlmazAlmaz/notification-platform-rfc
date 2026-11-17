@@ -1,0 +1,48 @@
+@startuml
+title Option A — push timeout, SMS failover and late receipts
+hide footbox
+autonumber
+skinparam sequenceMessageAlign center
+participant "Orchestrator /\ndurable timer scanner" as FSM
+database "PostgreSQL\nledger + outbox" as DB
+participant "Relay + Kafka" as Q
+participant "Channel worker" as Worker
+participant "SMS-A / SMS-B" as SMS
+participant "Email provider" as Email
+participant "Receipt Gateway" as Receipt
+
+note over FSM, DB: PUSH attempt accepted at t0; no app receipt.\nDurable push deadline = t0+8s.
+FSM -> DB: At deadline: lock notification; check receipt/state/version
+alt Receipt already committed
+  DB --> FSM: DELIVERED; timer becomes no-op
+else No delivery evidence
+  FSM -> DB: CAS next attempt SMS-A\nrecord attempt + command outbox atomically
+  Q -> Worker: SMS-A attempt_id (may be redelivered)
+  Worker -> DB: Claim; final pre-send check; durable DISPATCHING
+  Worker -> SMS: Send(same attempt_id idempotency key)
+  alt Explicit permanent / provider rejection
+    SMS --> Worker: Definitively not accepted
+    Worker -> DB: Record failure + outbox
+    FSM -> DB: CAS create SMS-B attempt (independent quota)
+    Q -> Worker: SMS-B attempt
+    Worker -> SMS: Send via SMS-B with its own attempt_id
+  else Network timeout / result unknown
+    Worker -> DB: UNKNOWN + durable reconcile deadline
+    Worker -> SMS: Query status by attempt_id
+    note over Worker, SMS: No blind retry with a new key.\nSame-provider resend only with contractual idempotency.
+    alt No conclusive receipt by t0+30s
+      FSM -> DB: CAS create eligible EMAIL attempt\nrecord residual-duplicate risk
+      Q -> Worker: Email attempt
+      Worker -> Email: Send same notification_id
+    end
+  else Provider acceptance
+    SMS --> Worker: message_id (not delivery proof)
+    Worker -> DB: WAIT_RECEIPT
+  end
+end
+SMS -> Receipt: Signed delivered receipt (possibly late / repeated)
+Receipt -> DB: Dedup receipt; monotonic CAS DELIVERED\ncancel only attempts not yet dispatched
+note over DB, Worker: Receipt racing with a timer is serialized by CAS.\nAn already-sent SMS cannot be recalled.\nLate cross-channel duplicates remain possible and are measured.
+FSM -> DB: At t0+60s without proof: record SLO breach; continue recovery
+FSM -> DB: At 24h unresolved: ESCALATED + incident; no silent drop
+@enduml
